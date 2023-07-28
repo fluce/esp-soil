@@ -1,0 +1,262 @@
+esphome:
+  name: soil
+
+esp32:
+  board: bpi_leaf_s3
+  variant: esp32s3
+  framework:
+    type: arduino
+    version: 2.0.9
+    platform_version: 6.3.1
+      
+# Enable logging
+logger:
+  level: VERBOSE
+
+api:
+  password: !secret api.password
+
+ota:
+  password: !secret ota.password
+
+wifi:
+  ssid: !secret wifi.ssid
+  password: !secret wifi.password
+
+globals:
+  - id: battery_level_raw_global
+    type: int
+
+  - id: restart_count_down_global
+    type: int
+    initial_value: '10'
+    restore_value: yes
+    
+  - id: measure_counter_global
+    type: int
+    initial_value: '0'
+    restore_value: yes
+
+sensor:
+
+  # soil moisture sensor
+  - platform: adc
+    pin: 5
+    id: soil_moisture
+    name: "Soil Moisture"
+    update_interval: never
+    filters:
+      - calibrate_linear:
+          - 0.0 -> 100.0
+          - 3.3 -> 0.0
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:water-percent"    
+
+  # battery level : ADC converter on pin 14 : 3.2V => 0% linear to 3.8V => 100%
+  - platform: adc2
+    pin: 14
+    name: "Battery Level"
+    id: battery_level
+    update_interval: never
+    attenuation: 11db
+    raw: true
+    oversampling: 8
+    filters:
+      - lambda: |-
+          if (isnan(x) || x < 6 || x > 4090) {
+            return NAN;
+          } else {
+            return x;
+          }
+      - calibrate_linear:
+          - 1624 -> 0.0
+          - 2300 -> 100.0
+      # filter lambda clamping value between 0 and 100
+      - lambda: |-
+          if (isnan(x)) {
+            return {};
+          } else if (x < 0.0) {
+            return 0.0;
+          } else if (x > 100.0) {
+            return 100.0;
+          } else {
+            return x;
+          }
+    on_raw_value:
+      then: 
+      - globals.set:
+          id: battery_level_raw_global
+          value: !lambda |- 
+            return x;
+        
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:battery"
+
+  # sensor returning battery_level raw value
+  - platform: template
+    name: "Battery Level Raw"
+    id: battery_level_raw
+    lambda: |-
+      auto val=id(battery_level_raw_global);
+      if (val==0) return {};
+      return val;
+
+  - platform: template
+    name: "Restart countdown"
+    lambda: |-
+      auto val=id(restart_count_down_global);
+      return val;
+
+  - platform: template
+    name: "Measure counter"
+    lambda: |-
+      auto val=id(measure_counter_global);
+      return val;
+
+  - platform: adc2
+    id: moisture_sensor_1_pc
+    pin: 13
+    name: "Humidité du sol 1"
+    attenuation: 11db
+    raw: true
+    oversampling: 8
+    update_interval: never
+    filters:
+      - lambda: |-
+          if (isnan(x) || x < 500 || x > 3000) {
+            return NAN;
+          } else {
+            return x;
+          }
+      - calibrate_linear:
+          - 2820 -> 0.0
+          - 1020 -> 100.0
+      # filter lambda clamping value between 0 and 100
+      - lambda: |-
+          if (isnan(x)) {
+            return {};
+          } else if (x < 0.0) {
+            return 0.0;
+          } else if (x > 100.0) {
+            return 100.0;
+          } else {
+            return x;
+          }
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: "mdi:water-percent"    
+
+  # sensor from home assistant for configuring deep sleep duration
+  - platform: homeassistant
+    id: measure_interval
+    entity_id: input_number.soil_1_measure_interval
+    internal: true
+
+output:
+  - platform: gpio
+    pin: 4
+    inverted: false
+    id: moisture_sensor_1_power
+
+switch:
+  - platform: output
+    name: "Moisture Sensor 1 power"
+    id: moisture_sensor_1_power_switch
+    output: 'moisture_sensor_1_power'    
+  
+  - platform: restart
+    name: "Auto Restart"
+    id: restart_switch
+    
+interval:
+  - interval: 60s
+    then:
+      - light.turn_on: 
+          id: light_1
+          red: 100%
+          green: 0%
+          blue: 100%
+          brightness: 20%
+      - wait_until:
+          condition:
+            api.connected: 
+          timeout: 20s
+      - if:
+          condition:
+            api.connected:
+          then:  
+            - light.turn_on: 
+                id: light_1
+                red: 0%
+                green: 100%
+                blue: 0%
+                brightness: 20%
+            - logger.log: 'Moisture Sensor 1 switch ON'
+            - lambda: |-
+                id(measure_counter_global)++;
+            - switch.turn_on: moisture_sensor_1_power_switch
+            - delay: 2s
+            - component.update: moisture_sensor_1_pc
+            - component.update: battery_level
+            - component.update: battery_level_raw
+            - component.update: soil_moisture            
+            - delay: 200ms
+            - logger.log: 'Moisture Sensor 1 switch OFF'
+            - switch.turn_off: moisture_sensor_1_power_switch
+            - light.turn_off: light_1
+            - delay: 4s
+          else:
+            - light.turn_on: 
+                id: light_1
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 20%
+            - delay: 4s
+      - light.turn_off: light_1
+      - delay: 1s
+      - if:
+          condition:
+            binary_sensor.is_on: disable_deep_sleep
+          then:
+            - logger.log: 'deep_sleep_goto_sleep Deep Sleep Disabled'
+            - delay: !lambda |-
+                return id(measure_interval).state * 60000.0;
+          else:
+            - logger.log: 'deep_sleep_goto_sleep Deep Sleep Enabled'
+            - lambda: |-
+                id(restart_count_down_global)--;                
+                if (id(restart_count_down_global)<=0) {
+                  id(restart_count_down_global)=10;
+                  id(restart_switch).toggle();
+                }
+            - deep_sleep.enter: 
+                id: deep_sleep_1
+                sleep_duration: !lambda |-
+                  return id(measure_interval).state * 60000.0;
+
+
+
+binary_sensor:
+  - platform: homeassistant
+    id: disable_deep_sleep
+    entity_id: input_boolean.disable_deep_sleep
+
+
+deep_sleep:
+  id: deep_sleep_1
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: light_1
+    rgb_order: GRB
+    pin: GPIO48
+    num_leds: 1
+    rmt_channel: 0
+    chipset: ws2812
+    name: "My Light"
+    restore_mode: ALWAYS_OFF 
+    default_transition_length: 0s      
+
